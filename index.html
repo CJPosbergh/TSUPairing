@@ -67,6 +67,13 @@
   }
   input[type=text]:focus { outline: 3px solid var(--tag); outline-offset: 1px; }
 
+  textarea {
+    width: 100%; font-size: 1rem; font-family: var(--sans);
+    padding: 12px; border: 2px solid var(--ink); border-radius: 8px;
+    background: var(--panel); color: var(--ink); resize: vertical;
+  }
+  textarea:focus { outline: 3px solid var(--tag); outline-offset: 1px; }
+
   button {
     font-family: var(--sans); font-size: 1.05rem; font-weight: 700;
     padding: 15px 18px; border-radius: 10px; border: 2px solid var(--ink);
@@ -245,6 +252,10 @@
       <div class="pairrow"><span class="k">TSU barcode</span><span class="v" id="cfBarcode"></span></div>
       <div class="pairrow"><span class="k">Timestamp</span><span class="v" id="cfTime" style="font-size:.9rem"></span></div>
     </div>
+    <div class="card stack">
+      <label for="cfNotes">Notes <span class="muted" style="text-transform:none;font-weight:400">(optional)</span></label>
+      <textarea id="cfNotes" rows="3" placeholder="e.g. re-scan, damaged tag, twin lamb…"></textarea>
+    </div>
     <div class="banner warn" id="cfWarn"></div>
     <div class="btnrow">
       <button class="danger" id="btnRetry">Retry scan</button>
@@ -303,6 +314,10 @@
     <div>
       <label for="editBarcode">TSU barcode</label>
       <input type="text" id="editBarcode" spellcheck="false">
+    </div>
+    <div>
+      <label for="editNotes">Notes</label>
+      <textarea id="editNotes" rows="2"></textarea>
     </div>
     <div class="btnrow">
       <button value="cancel" class="ghost" type="submit">Cancel</button>
@@ -369,8 +384,8 @@ function csvEscape(v) {
   return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g,'""') + '"' : v;
 }
 function buildCSV() {
-  const lines = ["ear_tag,barcode_id,timestamp"];
-  session.records.forEach(r => lines.push([r.tag, r.barcode, r.ts].map(csvEscape).join(",")));
+  const lines = ["Animal_ID,TSU_Barcode,timestamp,notes"];
+  session.records.forEach(r => lines.push([r.tag, r.barcode, r.ts, r.notes || ""].map(csvEscape).join(",")));
   return lines.join("\r\n") + "\r\n";
 }
 function downloadCSV(filename, text) {
@@ -415,7 +430,7 @@ $("btnToScan").onclick = goToScan;
 function goToScan() {
   const t = $("tagInput").value.trim().toUpperCase();
   if (!t) { $("tagInput").focus(); return; }
-  pending = { tag: t, barcode: null, ts: null };
+  pending = { tag: t, barcode: null, ts: null, notes: "" };
   $("scanTagChip").textContent = t;
   $("scanWarn").style.display = "none";
   show("scrScan");
@@ -525,6 +540,7 @@ function showConfirm() {
   $("cfTag").textContent = pending.tag;
   $("cfBarcode").textContent = pending.barcode;
   $("cfTime").textContent = pending.ts;
+  $("cfNotes").value = pending.notes || "";
   const dupB = session.records.find(r => r.barcode === pending.barcode);
   const dupT = session.records.find(r => r.tag === pending.tag);
   const w = $("cfWarn");
@@ -533,8 +549,9 @@ function showConfirm() {
   else w.style.display = "none";
   show("scrConfirm");
 }
-$("btnRetry").onclick = () => { pending.barcode = null; pending.ts = null; show("scrScan"); startCamera(); };
+$("btnRetry").onclick = () => { pending.barcode = null; pending.ts = null; pending.notes = $("cfNotes").value.trim(); show("scrScan"); startCamera(); };
 $("btnAccept").onclick = () => {
+  pending.notes = $("cfNotes").value.trim();
   session.records.push({ ...pending });
   pending = null;
   persist(); updateHeader(); refreshRecent();
@@ -546,7 +563,8 @@ $("btnAccept").onclick = () => {
 /* ================= recent + all records ================= */
 function fmtShortTime(ts) { return ts.slice(11,16); }
 function rowHTML(r, i) {
-  return `<td>${r.tag}</td><td>${r.barcode}<br><span class="muted" style="font-family:var(--sans)">${fmtShortTime(r.ts)}</span></td>
+  const noteFlag = r.notes ? ` <span title="${r.notes.replace(/"/g,'&quot;')}" style="color:var(--tag-deep)">📝</span>` : "";
+  return `<td>${r.tag}${noteFlag}</td><td>${r.barcode}<br><span class="muted" style="font-family:var(--sans)">${fmtShortTime(r.ts)}</span></td>
     <td class="actions"><button class="mini" data-edit="${i}">Edit</button> <button class="mini del" data-del="${i}">✕</button></td>`;
 }
 function refreshRecent() {
@@ -591,13 +609,15 @@ function openEdit(i) {
   editIdx = i;
   $("editTag").value = session.records[i].tag;
   $("editBarcode").value = session.records[i].barcode;
+  $("editNotes").value = session.records[i].notes || "";
   $("editDlg").showModal();
 }
 $("editDlg").addEventListener("close", () => {
   if ($("editDlg").returnValue === "save" && editIdx !== null) {
     const t = $("editTag").value.trim().toUpperCase();
     const b = $("editBarcode").value.trim();
-    if (t && b) { session.records[editIdx].tag = t; session.records[editIdx].barcode = b; persist(); refreshRecent(); if ($("scrAll").classList.contains("active")) renderAll(); }
+    const n = $("editNotes").value.trim();
+    if (t && b) { session.records[editIdx].tag = t; session.records[editIdx].barcode = b; session.records[editIdx].notes = n; persist(); refreshRecent(); if ($("scrAll").classList.contains("active")) renderAll(); }
   }
   editIdx = null;
 });
@@ -655,3 +675,4 @@ window.addEventListener("pagehide", stopCamera);
 </script>
 </body>
 </html>
+
