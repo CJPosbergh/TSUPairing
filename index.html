@@ -251,8 +251,19 @@
       <div class="banner info" id="doneInfo"></div>
       <p class="muted">The CSV has been downloaded to this device. If the download didn't start, use the button below.</p>
       <button id="btnRedownload">Download CSV again</button>
-      <button class="primary" id="btnNewSession">Start a new session</button>
     </div>
+
+    <div class="card stack">
+      <h2 style="font-size:1rem">Send by email</h2>
+      <div>
+        <label for="recipientEmail">Recipient (saved on this device)</label>
+        <input type="text" id="recipientEmail" autocomplete="email" spellcheck="false" placeholder="you@example.com">
+      </div>
+      <button class="amber" id="btnShareEmail">Share / email CSV</button>
+      <p class="muted" id="shareHint">Opens your phone's share sheet — pick Gmail or Mail and the CSV attaches automatically.</p>
+    </div>
+
+    <button class="primary" id="btnNewSession">Start a new session</button>
   </section>
 
 </main>
@@ -587,6 +598,40 @@ $("btnFinish").onclick = () => {
 };
 $("btnRedownload").onclick = () => { if (lastSavedCSV) downloadCSV(lastSavedCSV.filename, lastSavedCSV.text); };
 $("btnNewSession").onclick = () => { initStart(); show("scrStart"); };
+
+/* ================= share / email ================= */
+const RECIPIENT_KEY = "tsu_pairing_recipient";
+$("recipientEmail").value = localStorage.getItem(RECIPIENT_KEY) || "";
+$("recipientEmail").addEventListener("change", () => {
+  localStorage.setItem(RECIPIENT_KEY, $("recipientEmail").value.trim());
+});
+
+$("btnShareEmail").onclick = async () => {
+  if (!lastSavedCSV) return;
+  const recipient = $("recipientEmail").value.trim();
+  const subject = `TSU pairing data — ${lastSavedCSV.filename.replace(/\.csv$/,'')}`;
+  const body = `Attached: ${lastSavedCSV.filename}\nRecords: ${lastSavedCSV.text.trim().split(/\r\n|\n/).length - 1}`;
+
+  const file = new File([lastSavedCSV.text], lastSavedCSV.filename, { type: "text/csv" });
+  const canShareFiles = navigator.canShare && navigator.canShare({ files: [file] });
+
+  if (navigator.share && canShareFiles) {
+    try {
+      await navigator.share({ files: [file], title: subject, text: recipient ? `To: ${recipient}\n${body}` : body });
+      return; // user picks Gmail/Mail/etc from the OS share sheet; attachment included
+    } catch (err) {
+      if (err && err.name === "AbortError") return; // user cancelled, don't fall through
+    }
+  }
+
+  // Fallback: mailto can't attach files, so re-download the CSV and open a
+  // pre-addressed draft with instructions to attach it manually.
+  downloadCSV(lastSavedCSV.filename, lastSavedCSV.text);
+  const mailto = `mailto:${encodeURIComponent(recipient)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(
+    body + `\n\n(Your browser can't attach files automatically — the CSV was just downloaded again; attach it from your Downloads folder before sending.)`
+  )}`;
+  window.location.href = mailto;
+};
 
 /* ================= boot ================= */
 initStart();
