@@ -476,6 +476,9 @@ function updateHeader() {
 }
 function csvEscape(v) {
   v = String(v ?? "");
+  // Neutralize CSV formula injection: a leading apostrophe forces text
+  // interpretation in Excel/Sheets and is hidden from the displayed cell.
+  if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
   return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g,'""') + '"' : v;
 }
 function buildCSV() {
@@ -608,6 +611,8 @@ function loadZXing() {
     if (window.ZXing) return resolve();
     const s = document.createElement("script");
     s.src = "https://cdnjs.cloudflare.com/ajax/libs/zxing-library/0.21.3/zxing-library.min.js";
+    s.integrity = "sha384-BzBxP10ZE72aitqj5UMmUsbKFliP/DZqA8Wq+BNNhlIJDGoEd1tpkMYXOg9+n6sB";
+    s.crossOrigin = "anonymous";
     s.onload = resolve;
     s.onerror = () => reject(new Error("decoder load failed"));
     document.head.appendChild(s);
@@ -797,3 +802,4 @@ window.addEventListener("pagehide", stopCamera);
 </script>
 </body>
 </html>
+
