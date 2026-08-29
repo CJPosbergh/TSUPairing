@@ -84,6 +84,15 @@
   button.amber { background: var(--tag); border-color: var(--tag-deep); color: var(--ink); }
   button.ghost { background: transparent; border-color: var(--line); color: var(--mut); font-weight: 600; }
   button.danger { background: transparent; border-color: var(--warn); color: var(--warn); }
+  button.toggleOpt { background: var(--panel); border-color: var(--line); color: var(--mut); font-weight: 700; }
+  button.toggleOpt.active { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+
+  select {
+    width: 100%; font-size: 1.05rem; font-family: var(--sans); font-weight: 600;
+    padding: 12px 14px; border: 2px solid var(--ink); border-radius: 8px;
+    background: var(--panel); color: var(--ink);
+  }
+  select:focus { outline: 3px solid var(--tag); outline-offset: 1px; }
   button:disabled { opacity: .45; }
   button:focus-visible { outline: 3px solid var(--tag); outline-offset: 2px; }
   .btnrow { display: flex; gap: 10px; }
@@ -211,6 +220,24 @@
         <label for="sessionName">Session name → CSV filename</label>
         <input type="text" id="sessionName" autocomplete="off" spellcheck="false">
       </div>
+      <div>
+        <label>Auto-backup CSV during session?</label>
+        <div class="btnrow">
+          <button type="button" class="toggleOpt" id="backupOnBtn">On</button>
+          <button type="button" class="toggleOpt" id="backupOffBtn">Off</button>
+        </div>
+      </div>
+      <div id="backupIntervalWrap">
+        <label for="backupInterval">Back up every</label>
+        <select id="backupInterval">
+          <option value="5">5 records</option>
+          <option value="10">10 records</option>
+          <option value="15">15 records</option>
+          <option value="20">20 records</option>
+          <option value="25">25 records</option>
+        </select>
+        <p class="muted" style="margin-top:6px">⚠ This downloads a separate backup CSV file each time (e.g. every 5 records) as extra insurance during the session. Only the final file from "Save & finish" is the complete one — earlier backups can be deleted afterward.</p>
+      </div>
       <button class="primary" id="btnStartSession">Start session</button>
     </div>
     <div class="card stack" id="recoveryCard" style="display:none">
@@ -228,7 +255,7 @@
     <div class="card stack">
       <h2>Ear tag</h2>
       <div>
-        <label for="tagInput">Type the animal's tag, then scan its TSU</label>
+        <label for="tagInput">Type the animal's tag or ID, then scan its TSU</label>
         <input type="text" id="tagInput" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="next" placeholder="e.g. 4521A">
       </div>
       <div class="banner warn" id="tagDupWarn"></div>
@@ -325,7 +352,7 @@
 
 <div id="toast" class="toast"></div>
 
-<footer>Data stays on this device · autosaves after every record · CSV backup every 5 records</footer>
+<footer>Data stays on this device · autosaves after every record · CSV backup per your settings</footer>
 
 <!-- edit dialog -->
 <dialog id="editDlg">
@@ -368,6 +395,7 @@
 
 /* ================= state ================= */
 const LS_KEY = "tsu_pairing_session_v1";
+const SETTINGS_KEY = "tsu_pairing_settings_v1";
 let session = null;        // { name, startedISO, records: [{tag, barcode, ts}] }
 let pending = null;        // { tag, barcode, ts }
 let stream = null;
@@ -375,6 +403,51 @@ let scanLoopId = null;
 let detector = null;
 let zxingReader = null;
 let lastSavedCSV = null;   // { filename, text }
+let backupEnabled = true;
+let backupInterval = 5;
+let wakeLock = null;
+let wakeLockWanted = false;
+
+async function requestWakeLock() {
+  wakeLockWanted = true;
+  if (!("wakeLock" in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch (err) { wakeLock = null; }
+}
+function releaseWakeLock() {
+  wakeLockWanted = false;
+  if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+}
+document.addEventListener("visibilitychange", () => {
+  if (wakeLockWanted && document.visibilityState === "visible" && !wakeLock) requestWakeLock();
+});
+
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+    if (s) {
+      backupEnabled = s.backupEnabled !== false;
+      backupInterval = [5,10,15,20,25].includes(s.backupInterval) ? s.backupInterval : 5;
+    }
+  } catch(e) {}
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ backupEnabled, backupInterval })); } catch(e) {}
+}
+function applySettingsToUI() {
+  $("backupOnBtn").classList.toggle("active", backupEnabled);
+  $("backupOffBtn").classList.toggle("active", !backupEnabled);
+  $("backupIntervalWrap").style.display = backupEnabled ? "" : "none";
+  $("backupInterval").value = String(backupInterval);
+}
+$("backupOnBtn").onclick = () => { backupEnabled = true; saveSettings(); applySettingsToUI(); };
+$("backupOffBtn").onclick = () => { backupEnabled = false; saveSettings(); applySettingsToUI(); };
+$("backupInterval").addEventListener("change", () => {
+  backupInterval = parseInt($("backupInterval").value, 10);
+  saveSettings();
+});
 
 /* ================= helpers ================= */
 const $ = id => document.getElementById(id);
@@ -431,6 +504,8 @@ function showToast(msg) {
 let recoverableData = null;
 function initStart() {
   $("sessionName").value = defaultSessionName();
+  loadSettings();
+  applySettingsToUI();
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch(e){}
   if (saved && saved.records && saved.records.length) {
@@ -438,7 +513,7 @@ function initStart() {
     $("recoveryCard").style.display = "";
     $("recoveryInfo").textContent =
       `"${saved.name}" — ${saved.records.length} record${saved.records.length===1?"":"s"}, started ${saved.startedISO.slice(0,16).replace("T"," ")}. It was never saved to CSV.`;
-    $("btnRecover").onclick = () => { session = saved; recoverableData = null; updateHeader(); refreshRecent(); show("scrTag"); };
+    $("btnRecover").onclick = () => { session = saved; recoverableData = null; updateHeader(); refreshRecent(); show("scrTag"); requestWakeLock(); };
     $("btnDiscardRecovery").onclick = () => {
       if (!confirm(`Permanently discard ${saved.records.length} unsaved record${saved.records.length===1?"":"s"} from "${saved.name}"? This can't be undone.`)) return;
       clearPersist(); recoverableData = null; $("recoveryCard").style.display = "none";
@@ -455,6 +530,7 @@ $("btnStartSession").onclick = () => {
   }
   session = { name: sanitizeFilename($("sessionName").value), startedISO: nowISO(), records: [] };
   persist(); updateHeader(); refreshRecent(); show("scrTag");
+  requestWakeLock();
 };
 
 /* ================= tag entry ================= */
@@ -590,7 +666,6 @@ function showConfirm() {
   show("scrConfirm");
 }
 $("btnRetry").onclick = () => { pending.barcode = null; pending.ts = null; pending.notes = $("cfNotes").value.trim(); show("scrScan"); startCamera(); };
-const AUTO_BACKUP_INTERVAL = 5;
 $("btnAccept").onclick = () => {
   pending.notes = $("cfNotes").value.trim();
   session.records.push({ ...pending });
@@ -598,7 +673,7 @@ $("btnAccept").onclick = () => {
   persist(); updateHeader(); refreshRecent();
   $("tagInput").value = "";
   $("tagDupWarn").style.display = "none";
-  if (session.records.length % AUTO_BACKUP_INTERVAL === 0) {
+  if (backupEnabled && session.records.length % backupInterval === 0) {
     const filename = `${session.name}_backup_${session.records.length}.csv`;
     downloadCSV(filename, buildCSV());
     showToast(`Backup saved — ${session.records.length} records (${filename})`);
@@ -670,6 +745,7 @@ $("editDlg").addEventListener("close", () => {
 
 /* ================= save & finish ================= */
 $("btnFinish").onclick = () => {
+  releaseWakeLock();
   if (!session.records.length) {
     if (!confirm("No records yet — finish anyway without saving a CSV?")) return;
     clearPersist(); session = null; updateHeader(); initStart(); show("scrStart"); return;
@@ -719,8 +795,5 @@ initStart();
 updateHeader();
 window.addEventListener("pagehide", stopCamera);
 </script>
-</body>
-</html>
-
 </body>
 </html>
