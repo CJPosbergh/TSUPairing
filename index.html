@@ -442,15 +442,15 @@ function applySettingsToUI() {
   $("backupIntervalWrap").style.display = backupEnabled ? "" : "none";
   $("backupInterval").value = String(backupInterval);
 }
+
+/* ================= helpers ================= */
+const $ = id => document.getElementById(id);
 $("backupOnBtn").onclick = () => { backupEnabled = true; saveSettings(); applySettingsToUI(); };
 $("backupOffBtn").onclick = () => { backupEnabled = false; saveSettings(); applySettingsToUI(); };
 $("backupInterval").addEventListener("change", () => {
   backupInterval = parseInt($("backupInterval").value, 10);
   saveSettings();
 });
-
-/* ================= helpers ================= */
-const $ = id => document.getElementById(id);
 const screens = ["scrStart","scrTag","scrScan","scrConfirm","scrAll","scrDone"];
 function show(id) {
   screens.forEach(s => $(s).classList.toggle("active", s === id));
