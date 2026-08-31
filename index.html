@@ -851,16 +851,22 @@ $("btnShareEmail").onclick = async () => {
   const subject = `TSU pairing data — ${lastSavedFile.filename.replace(/\.(csv|xlsx)$/,'')}`;
   const body = `Attached: ${lastSavedFile.filename}`;
 
-  const file = new File([lastSavedFile.blob], lastSavedFile.filename, { type: lastSavedFile.blob.type });
-  const canShareFiles = navigator.canShare && navigator.canShare({ files: [file] });
+  async function tryShare(mimeType) {
+    const file = new File([lastSavedFile.blob], lastSavedFile.filename, { type: mimeType });
+    if (!navigator.share || !(navigator.canShare && navigator.canShare({ files: [file] }))) return false;
+    await navigator.share({ files: [file], title: subject, text: body });
+    return true;
+  }
 
-  if (navigator.share && canShareFiles) {
-    try {
-      await navigator.share({ files: [file], title: subject, text: body });
-      return; // user picks Gmail/Mail/etc from the OS share sheet; attachment included
-    } catch (err) {
-      if (err && err.name === "AbortError") return; // user cancelled, don't fall through
-    }
+  try {
+    // Attempt with the file's real MIME type first.
+    if (await tryShare(lastSavedFile.blob.type)) return;
+    // Some Android/Chrome builds reject less-common MIME types (like xlsx's)
+    // even when file sharing itself works fine — retry as a generic binary.
+    if (await tryShare("application/octet-stream")) return;
+  } catch (err) {
+    if (err && err.name === "AbortError") return; // user cancelled the share sheet, don't fall through
+    console.warn("Share failed, falling back to email draft:", err);
   }
 
   // Fallback: mailto can't attach files, so re-download the file and open a
@@ -881,5 +887,7 @@ updateHeader();
 window.addEventListener("pagehide", stopCamera);
 </script>
 </body>
+</html>
+
 </html>
 
