@@ -850,12 +850,21 @@ $("btnShareEmail").onclick = async () => {
   if (!lastSavedFile) return;
   const subject = `TSU pairing data — ${lastSavedFile.filename.replace(/\.(csv|xlsx)$/,'')}`;
   const body = `Attached: ${lastSavedFile.filename}`;
+  const diag = [];
 
   async function tryShare(mimeType) {
+    if (!navigator.share) { diag.push(`${mimeType}: navigator.share unavailable`); return false; }
     const file = new File([lastSavedFile.blob], lastSavedFile.filename, { type: mimeType });
-    if (!navigator.share || !(navigator.canShare && navigator.canShare({ files: [file] }))) return false;
-    await navigator.share({ files: [file], title: subject, text: body });
-    return true;
+    const can = navigator.canShare && navigator.canShare({ files: [file] });
+    if (!can) { diag.push(`${mimeType}: canShare=false`); return false; }
+    try {
+      await navigator.share({ files: [file], title: subject, text: body });
+      return true;
+    } catch (err) {
+      if (err && err.name === "AbortError") throw err; // user cancelled — bubble up, don't retry
+      diag.push(`${mimeType}: canShare=true but share() failed — ${err && err.name}: ${err && err.message}`);
+      return false;
+    }
   }
 
   try {
@@ -866,8 +875,10 @@ $("btnShareEmail").onclick = async () => {
     if (await tryShare("application/octet-stream")) return;
   } catch (err) {
     if (err && err.name === "AbortError") return; // user cancelled the share sheet, don't fall through
-    console.warn("Share failed, falling back to email draft:", err);
   }
+
+  console.warn("Share failed, falling back to email draft:", diag);
+  alert("Couldn't attach the file directly (" + diag.join(" | ") + "). Downloading it instead — attach it manually from Downloads.");
 
   // Fallback: mailto can't attach files, so re-download the file and open a
   // draft with instructions to attach it manually.
@@ -889,5 +900,4 @@ window.addEventListener("pagehide", stopCamera);
 </body>
 </html>
 
-</html>
 
