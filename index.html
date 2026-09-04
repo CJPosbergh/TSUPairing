@@ -248,6 +248,9 @@
         <button class="danger" id="btnDiscardRecovery">Discard</button>
       </div>
     </div>
+    <p class="muted" style="text-align:center">
+      <button class="ghost" id="btnManualRecover" style="padding:8px 12px;font-size:.8rem">Recover data manually</button>
+    </p>
   </section>
 
   <!-- ============ SCREEN: ear tag entry ============ -->
@@ -329,14 +332,14 @@
     <div class="card stack">
       <h2>Session saved</h2>
       <div class="banner info" id="doneInfo"></div>
-      <p class="muted">The CSV has been downloaded to this device. If the download didn't start, use the button below.</p>
-      <button id="btnRedownload">Download CSV again</button>
+      <p class="muted">The file has been downloaded to this device. If the download didn't start, use the button below.</p>
+      <button id="btnRedownload">Download again</button>
     </div>
 
     <div class="card stack">
       <h2 style="font-size:1rem">Send by email</h2>
-      <button class="amber" id="btnShareEmail">Share / email CSV</button>
-      <p class="muted" id="shareHint">Opens your phone's share sheet — pick Gmail or Mail and the CSV attaches automatically.</p>
+      <button class="amber" id="btnShareEmail">Share / email file</button>
+      <p class="muted" id="shareHint">Opens your phone's share sheet — pick Gmail or Mail and the file attaches automatically.</p>
     </div>
 
     <div class="thanksCard">
@@ -390,6 +393,23 @@
   </form>
 </dialog>
 
+<!-- manual recovery dialog -->
+<dialog id="recoverDlg" style="max-width:500px">
+  <div class="stack">
+    <h2 style="font-size:1rem">Manual data recovery</h2>
+    <p class="muted" id="recoverStatus">Checking browser storage…</p>
+    <div id="recoverFound" class="stack" style="display:none">
+      <p class="muted">This reads directly from this browser's storage, bypassing the normal session check.</p>
+      <button class="amber" id="btnRecoverExport">Download as CSV</button>
+    </div>
+    <div id="recoverRaw" class="stack" style="display:none">
+      <label for="recoverRawText">Raw stored data (couldn't be read automatically — copy this and send it if you need help)</label>
+      <textarea id="recoverRawText" rows="6" readonly style="font-family:var(--mono);font-size:.75rem"></textarea>
+    </div>
+    <button class="ghost" id="btnRecoverClose">Close</button>
+  </div>
+</dialog>
+
 <script>
 "use strict";
 
@@ -402,7 +422,7 @@ let stream = null;
 let scanLoopId = null;
 let detector = null;
 let zxingReader = null;
-let lastSavedCSV = null;   // { filename, text }
+let lastSavedFile = null;  // { filename, blob, kind: "csv"|"xlsx" }
 let backupEnabled = true;
 let backupInterval = 5;
 let wakeLock = null;
@@ -481,18 +501,20 @@ function csvEscape(v) {
   if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
   return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g,'""') + '"' : v;
 }
-function buildCSV() {
+function buildCSV(records) {
   const lines = ["Animal_ID,TSU_Barcode,timestamp,notes"];
-  session.records.forEach(r => lines.push([r.tag, r.barcode, r.ts, r.notes || ""].map(csvEscape).join(",")));
+  (records || session.records).forEach(r => lines.push([r.tag, r.barcode, r.ts, r.notes || ""].map(csvEscape).join(",")));
   return lines.join("\r\n") + "\r\n";
 }
-function downloadCSV(filename, text) {
-  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+function downloadBlob(filename, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+function downloadCSV(filename, text) {
+  downloadBlob(filename, new Blob([text], { type: "text/csv;charset=utf-8" }));
 }
 let toastTimer = null;
 function showToast(msg) {
@@ -515,7 +537,7 @@ function initStart() {
     recoverableData = saved;
     $("recoveryCard").style.display = "";
     $("recoveryInfo").textContent =
-      `"${saved.name}" — ${saved.records.length} record${saved.records.length===1?"":"s"}, started ${saved.startedISO.slice(0,16).replace("T"," ")}. It was never saved to CSV.`;
+      `"${saved.name}" — ${saved.records.length} record${saved.records.length===1?"":"s"}, started ${saved.startedISO.slice(0,16).replace("T"," ")}. It was never saved to a file.`;
     $("btnRecover").onclick = () => { session = saved; recoverableData = null; updateHeader(); refreshRecent(); show("scrTag"); requestWakeLock(); };
     $("btnDiscardRecovery").onclick = () => {
       if (!confirm(`Permanently discard ${saved.records.length} unsaved record${saved.records.length===1?"":"s"} from "${saved.name}"? This can't be undone.`)) return;
@@ -526,6 +548,46 @@ function initStart() {
     $("recoveryCard").style.display = "none";
   }
 }
+
+/* ================= manual recovery tool ================= */
+$("btnManualRecover").onclick = () => {
+  const status = $("recoverStatus");
+  const foundBox = $("recoverFound");
+  const rawBox = $("recoverRaw");
+  foundBox.style.display = "none";
+  rawBox.style.display = "none";
+
+  let raw = null;
+  try { raw = localStorage.getItem(LS_KEY); } catch(e) {
+    status.textContent = "Couldn't access browser storage on this device.";
+    $("recoverDlg").showModal();
+    return;
+  }
+
+  if (!raw) {
+    status.textContent = "No stored session data found in this browser.";
+    $("recoverDlg").showModal();
+    return;
+  }
+
+  let parsed = null;
+  try { parsed = JSON.parse(raw); } catch(e) { parsed = null; }
+
+  if (parsed && Array.isArray(parsed.records) && parsed.records.length) {
+    status.textContent = `Found "${parsed.name || "unnamed session"}" — ${parsed.records.length} record${parsed.records.length===1?"":"s"}.`;
+    foundBox.style.display = "";
+    $("btnRecoverExport").onclick = () => {
+      const filename = (parsed.name ? sanitizeFilename(parsed.name) : "recovered") + "_recovered.csv";
+      downloadBlob(filename, new Blob([buildCSV(parsed.records)], { type: "text/csv;charset=utf-8" }));
+    };
+  } else {
+    status.textContent = "Stored data was found but couldn't be read as a normal session.";
+    rawBox.style.display = "";
+    $("recoverRawText").value = raw;
+  }
+  $("recoverDlg").showModal();
+};
+$("btnRecoverClose").onclick = () => $("recoverDlg").close();
 $("btnStartSession").onclick = () => {
   if (recoverableData) {
     alert(`You have an unsaved session ("${recoverableData.name}", ${recoverableData.records.length} record${recoverableData.records.length===1?"":"s"}) that hasn't been saved to CSV yet. Resume or discard it above before starting a new one.`);
@@ -757,40 +819,58 @@ $("btnFinish").onclick = () => {
   }
   const filename = session.name + ".csv";
   const text = buildCSV();
-  downloadCSV(filename, text);
-  lastSavedCSV = { filename, text };
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+  downloadBlob(filename, blob);
+  lastSavedFile = { filename, blob, kind: "csv" };
   $("doneInfo").textContent = `${session.records.length} record${session.records.length===1?"":"s"} saved to ${filename}`;
   $("doneInfo").classList.add("info");
   clearPersist();
   session = null; updateHeader();
   show("scrDone");
 };
-$("btnRedownload").onclick = () => { if (lastSavedCSV) downloadCSV(lastSavedCSV.filename, lastSavedCSV.text); };
+$("btnRedownload").onclick = () => { if (lastSavedFile) downloadBlob(lastSavedFile.filename, lastSavedFile.blob); };
 $("btnNewSession").onclick = () => { initStart(); show("scrStart"); };
 
 /* ================= share / email ================= */
 $("btnShareEmail").onclick = async () => {
-  if (!lastSavedCSV) return;
-  const subject = `TSU pairing data — ${lastSavedCSV.filename.replace(/\.csv$/,'')}`;
-  const body = `Attached: ${lastSavedCSV.filename}\nRecords: ${lastSavedCSV.text.trim().split(/\r\n|\n/).length - 1}`;
+  if (!lastSavedFile) return;
+  const subject = `TSU pairing data — ${lastSavedFile.filename.replace(/\.(csv|xlsx)$/,'')}`;
+  const body = `Attached: ${lastSavedFile.filename}`;
+  const diag = [];
 
-  const file = new File([lastSavedCSV.text], lastSavedCSV.filename, { type: "text/csv" });
-  const canShareFiles = navigator.canShare && navigator.canShare({ files: [file] });
-
-  if (navigator.share && canShareFiles) {
+  async function tryShare(mimeType) {
+    if (!navigator.share) { diag.push(`${mimeType}: navigator.share unavailable`); return false; }
+    const file = new File([lastSavedFile.blob], lastSavedFile.filename, { type: mimeType });
+    const can = navigator.canShare && navigator.canShare({ files: [file] });
+    if (!can) { diag.push(`${mimeType}: canShare=false`); return false; }
     try {
       await navigator.share({ files: [file], title: subject, text: body });
-      return; // user picks Gmail/Mail/etc from the OS share sheet; attachment included
+      return true;
     } catch (err) {
-      if (err && err.name === "AbortError") return; // user cancelled, don't fall through
+      if (err && err.name === "AbortError") throw err; // user cancelled — bubble up, don't retry
+      diag.push(`${mimeType}: canShare=true but share() failed — ${err && err.name}: ${err && err.message}`);
+      return false;
     }
   }
 
-  // Fallback: mailto can't attach files, so re-download the CSV and open a
+  try {
+    // Attempt with the file's real MIME type first.
+    if (await tryShare(lastSavedFile.blob.type)) return;
+    // Some Android/Chrome builds reject less-common MIME types (like xlsx's)
+    // even when file sharing itself works fine — retry as a generic binary.
+    if (await tryShare("application/octet-stream")) return;
+  } catch (err) {
+    if (err && err.name === "AbortError") return; // user cancelled the share sheet, don't fall through
+  }
+
+  console.warn("Share failed, falling back to email draft:", diag);
+  alert("Couldn't attach the file directly (" + diag.join(" | ") + "). Downloading it instead — attach it manually from Downloads.");
+
+  // Fallback: mailto can't attach files, so re-download the file and open a
   // draft with instructions to attach it manually.
-  downloadCSV(lastSavedCSV.filename, lastSavedCSV.text);
+  downloadBlob(lastSavedFile.filename, lastSavedFile.blob);
   const mailto = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(
-    body + `\n\n(Your browser can't attach files automatically — the CSV was just downloaded again; attach it from your Downloads folder before sending.)`
+    body + `\n\n(Your browser can't attach files automatically — the file was just downloaded again; attach it from your Downloads folder before sending.)`
   )}`;
   window.location.href = mailto;
 };
