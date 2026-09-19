@@ -261,6 +261,7 @@
         <label for="tagInput">Type the animal's tag, then scan its TSU</label>
         <input type="text" id="tagInput" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="next" placeholder="e.g. 4521A">
       </div>
+      <button class="ghost" id="btnScanTag" style="font-size:.9rem">📷 Or scan a tag barcode instead</button>
       <div class="banner warn" id="tagDupWarn"></div>
       <button class="primary" id="btnToScan">Next — scan TSU barcode</button>
     </div>
@@ -282,7 +283,7 @@
   <!-- ============ SCREEN: scan ============ -->
   <section class="screen" id="scrScan">
     <div>
-      <p style="margin-bottom:8px">Scanning TSU for tag <span class="tagchip" id="scanTagChip"></span></p>
+      <p style="margin-bottom:8px" id="scanHeadLine">Scanning TSU for tag <span class="tagchip" id="scanTagChip"></span></p>
       <div class="scanwrap">
         <video id="video" playsinline muted></video>
         <div class="reticle"><div class="box"></div></div>
@@ -292,7 +293,7 @@
     <div class="banner warn" id="scanWarn"></div>
     <div class="btnrow">
       <button class="ghost" id="btnScanBack">Back</button>
-      <button id="btnManualBarcode">Type barcode manually</button>
+      <button id="btnManualBarcode">Type manually</button>
     </div>
   </section>
 
@@ -337,9 +338,9 @@
     </div>
 
     <div class="card stack">
-      <h2 style="font-size:1rem">Send by email</h2>
-      <button class="amber" id="btnShareEmail">Share / email file</button>
-      <p class="muted" id="shareHint">Opens your phone's share sheet — pick Gmail or Mail and the file attaches automatically.</p>
+      <h2 style="font-size:1rem">Send by email or message</h2>
+      <button class="amber" id="btnShareEmail">Download &amp; email file</button>
+      <p class="muted" id="shareHint">Downloads the file and opens a blank email. If your phone doesn't attach it automatically, tap the paperclip in Gmail or Outlook and pick the file from your <strong>Downloads</strong> folder before sending.</p>
     </div>
 
     <div class="thanksCard">
@@ -383,8 +384,8 @@
 <!-- manual barcode dialog -->
 <dialog id="manualDlg">
   <form method="dialog" class="stack">
-    <h2 style="font-size:1rem">Type TSU barcode</h2>
-    <p class="muted">Use the human-readable ID printed on the TSU panel.</p>
+    <h2 style="font-size:1rem" id="manualDlgTitle">Type TSU barcode</h2>
+    <p class="muted" id="manualDlgHint">Use the human-readable ID printed on the TSU panel.</p>
     <input type="text" id="manualBarcode" spellcheck="false" autocomplete="off">
     <div class="btnrow">
       <button value="cancel" class="ghost" type="submit">Cancel</button>
@@ -418,6 +419,7 @@ const LS_KEY = "tsu_pairing_session_v1";
 const SETTINGS_KEY = "tsu_pairing_settings_v1";
 let session = null;        // { name, startedISO, records: [{tag, barcode, ts}] }
 let pending = null;        // { tag, barcode, ts }
+let scanMode = "barcode";  // "barcode" = scanning a TSU; "tag" = scanning an ear-tag barcode
 let stream = null;
 let scanLoopId = null;
 let detector = null;
@@ -611,12 +613,23 @@ $("btnToScan").onclick = goToScan;
 function goToScan() {
   const t = $("tagInput").value.trim().toUpperCase();
   if (!t) { $("tagInput").focus(); return; }
+  scanMode = "barcode";
   pending = { tag: t, barcode: null, ts: null, notes: "" };
+  $("scanHeadLine").innerHTML = 'Scanning TSU for tag <span class="tagchip" id="scanTagChip"></span>';
   $("scanTagChip").textContent = t;
   $("scanWarn").style.display = "none";
   show("scrScan");
   startCamera();
 }
+
+/* scan a barcode INTO the tag field (optional alternative to typing it) */
+$("btnScanTag").onclick = () => {
+  scanMode = "tag";
+  $("scanHeadLine").textContent = "Scan the tag's barcode";
+  $("scanWarn").style.display = "none";
+  show("scrScan");
+  startCamera();
+};
 
 /* ================= camera + decode ================= */
 async function startCamera() {
@@ -638,13 +651,16 @@ async function startCamera() {
         if (want.length) detector = new window.BarcodeDetector({ formats: want });
       } catch(e) { detector = null; }
     }
+    const prompt = scanMode === "tag"
+      ? "Hold the tag barcode inside the frame"
+      : "Hold the TSU barcode inside the frame";
     if (detector) {
-      status.textContent = "Hold the TSU barcode inside the frame";
+      status.textContent = prompt;
       nativeLoop();
     } else {
       status.textContent = "Loading decoder…";
       await loadZXing();
-      status.textContent = "Hold the TSU barcode inside the frame";
+      status.textContent = prompt;
       zxingLoop();
     }
   } catch (err) {
@@ -697,18 +713,33 @@ function zxingLoop() {
   }
 }
 function onDecoded(text) {
-  if (!pending || pending.barcode) return;
+  const val = String(text).trim();
   if (navigator.vibrate) navigator.vibrate(80);
+  if (scanMode === "tag") {
+    stopCamera();
+    $("tagInput").value = val.toUpperCase();
+    $("tagInput").dispatchEvent(new Event("input")); // run the duplicate check
+    show("scrTag");
+    return;
+  }
+  if (!pending || pending.barcode) return;
   stopCamera();
-  pending.barcode = String(text).trim();
+  pending.barcode = val;
   pending.ts = nowISO();
   showConfirm();
 }
 
 /* scan screen buttons */
-$("btnScanBack").onclick = () => { pending = null; show("scrTag"); };
+$("btnScanBack").onclick = () => { stopCamera(); if (scanMode === "barcode") pending = null; show("scrTag"); };
 $("btnManualBarcode").onclick = () => {
   $("manualBarcode").value = "";
+  if (scanMode === "tag") {
+    $("manualDlgTitle").textContent = "Type the tag";
+    $("manualDlgHint").textContent = "Enter the animal's ear-tag ID.";
+  } else {
+    $("manualDlgTitle").textContent = "Type TSU barcode";
+    $("manualDlgHint").textContent = "Use the human-readable ID printed on the TSU panel.";
+  }
   $("manualDlg").showModal();
 };
 $("manualDlg").addEventListener("close", () => {
@@ -858,7 +889,7 @@ $("btnShareEmail").onclick = async () => {
   // draft with instructions to attach it manually.
   downloadBlob(lastSavedFile.filename, lastSavedFile.blob);
   const mailto = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(
-    body + `\n\n(Your browser can't attach files automatically — the file was just downloaded again; attach it from your Downloads folder before sending.)`
+    body + `\n\nThe file was just downloaded to your phone. Tap the paperclip in your email app and attach it from your Downloads folder before sending.`
   )}`;
   window.location.href = mailto;
 };
@@ -870,3 +901,4 @@ window.addEventListener("pagehide", stopCamera);
 </script>
 </body>
 </html>
+
