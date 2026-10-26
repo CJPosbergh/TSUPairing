@@ -291,6 +291,8 @@
       </div>
     </div>
     <div class="banner warn" id="scanWarn"></div>
+    <button id="btnPhotoScan">📷 Not reading? Take a photo instead</button>
+    <input type="file" id="photoInput" accept="image/*" capture="environment" hidden>
     <div class="btnrow">
       <button class="ghost" id="btnScanBack">Back</button>
       <button id="btnManualBarcode">Type manually</button>
@@ -423,8 +425,7 @@ let scanMode = "barcode";  // "barcode" = scanning a TSU; "tag" = scanning an ea
 let stream = null;
 let scanLoopId = null;
 let detector = null;
-let zxingReader = null;
-let scanCanvas = null;     // offscreen canvas for cropped frame grabs (iOS-friendly decode)
+let scanCanvas = null;     // offscreen canvas for frame grabs (iPhone decode path)
 let lastSavedFile = null;  // { filename, blob, kind: "csv"|"xlsx" }
 let backupEnabled = true;
 let backupInterval = 5;
@@ -632,50 +633,115 @@ $("btnScanTag").onclick = () => {
   startCamera();
 };
 
-/* ================= camera + decode ================= */
+/* ================= camera + decode =================
+ * Android Chrome: native BarcodeDetector (fast, built in).
+ * iPhone/iPad (no BarcodeDetector): zxing-wasm — the C++ ZXing decoder compiled
+ * to WebAssembly. Unlike the old JS port it reads light-on-dark (inverted) Data
+ * Matrix codes and small/rotated codes much more reliably.
+ * Both files are pinned to an exact version and integrity-checked before use.
+ */
+const ZXW_JS   = "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/iife/reader/index.js";
+const ZXW_JS_SRI = "sha384-WftrM7hFN3CZH1pg8fvonijN1mDx8lh1U3L267n+snjsk/o7oBdEbUx5R8P3uw9S";
+const ZXW_WASM = "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/reader/zxing_reader.wasm";
+const ZXW_WASM_SHA384 = "nK2pHJVglp+a6HfEzYu3Das+oIISIChcnPvLUzhPoPHhi8NaJzy9dzcwIdK/dC0I";
+const ZXW_OPTS = { formats: ["DataMatrix","QRCode"], tryHarder: true, tryRotate: true,
+                   tryInvert: true, tryDownscale: true, maxNumberOfSymbols: 1 };
+let zxwReady = null;
+
+function hasNativeDataMatrix() {
+  return ("BarcodeDetector" in window);
+}
+async function getNativeDetector() {
+  if (detector) return detector;
+  if (!hasNativeDataMatrix()) return null;
+  try {
+    const fmts = await window.BarcodeDetector.getSupportedFormats();
+    const want = ["data_matrix","qr_code"].filter(f => fmts.includes(f));
+    if (want.length) detector = new window.BarcodeDetector({ formats: want });
+  } catch(e) { detector = null; }
+  return detector;
+}
+/* Load + integrity-check the WebAssembly decoder once; later calls reuse it. */
+function loadWasmDecoder() {
+  if (zxwReady) return zxwReady;
+  zxwReady = (async () => {
+    if (!window.ZXingWASM) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = ZXW_JS; s.integrity = ZXW_JS_SRI; s.crossOrigin = "anonymous";
+        s.onload = resolve;
+        s.onerror = () => reject(new Error("decoder script failed to load"));
+        document.head.appendChild(s);
+      });
+    }
+    const resp = await fetch(ZXW_WASM, { mode: "cors" });
+    if (!resp.ok) throw new Error("decoder download failed (" + resp.status + ")");
+    const buf = await resp.arrayBuffer();
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-384", buf));
+    let b64 = ""; digest.forEach(b => b64 += String.fromCharCode(b));
+    if (btoa(b64) !== ZXW_WASM_SHA384) throw new Error("decoder integrity check failed");
+    await window.ZXingWASM.prepareZXingModule({ overrides: { wasmBinary: buf }, fireImmediately: true });
+  })();
+  zxwReady.catch(() => { zxwReady = null; }); // allow a retry later (e.g. signal comes back)
+  return zxwReady;
+}
+async function wasmDecode(imageData) {
+  const res = await window.ZXingWASM.readBarcodes(imageData, ZXW_OPTS);
+  const hit = res.find(r => r.isValid && r.text);
+  return hit ? hit.text : null;
+}
+/* iPhone: fetch the decoder as soon as the app opens, so scanning still works
+   if you open the app with signal and then lose it out in the barn. */
+if (!hasNativeDataMatrix()) loadWasmDecoder().catch(() => {});
+
 async function startCamera() {
   const status = $("scanStatus");
   status.textContent = "Starting camera…";
-  detector = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
       audio: false
     });
     const v = $("video");
-    v.srcObject = stream;
     v.setAttribute("playsinline", "");        // iOS: keep inline, don't open fullscreen player
     v.setAttribute("webkit-playsinline", "");
     v.muted = true;
+    v.srcObject = stream;
     await v.play();
-    // Native BarcodeDetector (Android Chrome). iOS Safari has none, so this stays null there.
-    if ("BarcodeDetector" in window) {
-      try {
-        const fmts = await window.BarcodeDetector.getSupportedFormats();
-        const want = ["data_matrix","qr_code"].filter(f => fmts.includes(f));
-        if (want.length) detector = new window.BarcodeDetector({ formats: want });
-      } catch(e) { detector = null; }
-    }
+
     const prompt = scanMode === "tag"
       ? "Hold the tag barcode inside the frame"
       : "Hold the TSU barcode inside the frame";
-    if (detector) {
+    if (await getNativeDetector()) {
       status.textContent = prompt;
       nativeLoop();
-    } else {
-      status.textContent = "Loading decoder…";
-      await loadZXing();
-      if (!window.ZXing) { status.textContent = "Decoder failed to load — type it in manually."; return; }
-      status.textContent = prompt;
-      zxingCanvasLoop();
+      return;
     }
+    // iPhone path: continuous focus, and a little zoom so the tiny TSU code can be
+    // read from ~15 cm away (newer iPhones can't focus closer than that on video).
+    try {
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      const adv = {};
+      if (caps.focusMode && caps.focusMode.includes("continuous")) adv.focusMode = "continuous";
+      if (caps.zoom && caps.zoom.max >= 2) adv.zoom = 2;
+      if (Object.keys(adv).length) await track.applyConstraints({ advanced: [adv] });
+    } catch(e) { /* optional — ignore if unsupported */ }
+    status.textContent = "Loading decoder…";
+    try { await loadWasmDecoder(); }
+    catch(e) {
+      status.textContent = "Decoder couldn't load (no signal?) — use “Take photo” or “Type manually”.";
+      return;
+    }
+    if (!stream) return; // user left the screen while loading
+    status.textContent = prompt + " — about 15 cm (6 in) away";
+    wasmVideoLoop();
   } catch (err) {
-    status.textContent = "Camera unavailable — use “Type manually”. (" + (err && err.name || "error") + ")";
+    status.textContent = "Camera unavailable — use “Take photo” or “Type manually”. (" + (err && err.name || "error") + ")";
   }
 }
 function stopCamera() {
   if (scanLoopId) { cancelAnimationFrame(scanLoopId); scanLoopId = null; }
-  if (zxingReader) { try { zxingReader.reset(); } catch(e){} zxingReader = null; }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
 }
 function nativeLoop() {
@@ -690,81 +756,61 @@ function nativeLoop() {
   };
   scanLoopId = requestAnimationFrame(tick);
 }
-function loadZXing() {
-  return new Promise((resolve, reject) => {
-    if (window.ZXing) return resolve();
-    const s = document.createElement("script");
-    s.src = "https://cdnjs.cloudflare.com/ajax/libs/zxing-library/0.21.3/zxing-library.min.js";
-    s.integrity = "sha384-BzBxP10ZE72aitqj5UMmUsbKFliP/DZqA8Wq+BNNhlIJDGoEd1tpkMYXOg9+n6sB";
-    s.crossOrigin = "anonymous";
-    s.onload = resolve;
-    s.onerror = () => reject(new Error("decoder load failed"));
-    document.head.appendChild(s);
-  }).catch(() => {});
-}
-/*
- * iOS-friendly decode. ZXing's decodeFromStream is unreliable on Safari (the
- * continuous callback often never fires, and it decodes the whole low-res
- * frame). Instead we grab each frame into a canvas cropped to the center
- * square and upscaled, then decode that one still frame with the low-level
- * MultiFormatReader + a canvas luminance source — the stable API path. The
- * tighter, higher-contrast crop is what lets dense Data Matrix codes read on
- * iPhone. Works on Android's ZXing path too.
- */
-function zxingCanvasLoop() {
+/* iPhone live scanning: grab a center crop of the video at full resolution
+   (no downscaling — the TSU code is small) and decode it, ~6 times a second.
+   Alternates a tight and a wide crop so near and far codes both get a chance. */
+function wasmVideoLoop() {
   const v = $("video");
   if (!scanCanvas) scanCanvas = document.createElement("canvas");
   const ctx = scanCanvas.getContext("2d", { willReadFrequently: true });
-  const Z = window.ZXing;
-  let reader;
-  try {
-    const hints = new Map();
-    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [
-      Z.BarcodeFormat.DATA_MATRIX, Z.BarcodeFormat.QR_CODE
-    ]);
-    hints.set(Z.DecodeHintType.TRY_HARDER, true);
-    reader = new Z.MultiFormatReader();
-    reader.setHints(hints);
-  } catch(e) {
-    $("scanStatus").textContent = "Decoder error — type it in manually.";
-    return;
-  }
-  const OUT = 640; // upscaled square the decoder sees
-  scanCanvas.width = OUT; scanCanvas.height = OUT;
-
-  // Build a grayscale luminance buffer from the canvas and decode it. Using
-  // RGBLuminanceSource with our own gray values avoids relying on any class
-  // whose browser-build export we can't verify.
-  const decodeFrame = () => {
-    const img = ctx.getImageData(0, 0, OUT, OUT);
-    const d = img.data, n = OUT * OUT;
-    const lum = new Uint8ClampedArray(n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) {
-      // standard luma; r,g,b already de-gamma'd enough for barcode purposes
-      lum[i] = (d[j] * 306 + d[j+1] * 601 + d[j+2] * 117) >> 10;
-    }
-    const src = new Z.RGBLuminanceSource(lum, OUT, OUT);
-    const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(src));
-    return reader.decodeWithState(bmp); // throws NotFoundException when empty
-  };
-
-  const tick = () => {
+  let busy = false, last = 0, flip = false;
+  const tick = async (t) => {
     if (!stream) return;
-    const vw = v.videoWidth, vh = v.videoHeight;
-    if (vw && vh) {
-      const side = Math.min(vw, vh) * 0.7;   // center square crop, matches on-screen reticle
-      const sx = (vw - side) / 2, sy = (vh - side) / 2;
-      try {
-        ctx.drawImage(v, sx, sy, side, side, 0, 0, OUT, OUT);
-        const res = decodeFrame();
-        if (res) { onDecoded(res.getText()); return; }
-      } catch(e) {
-        try { reader.reset(); } catch(_){}  // clear decoder state between empty frames
-      }
-    }
     scanLoopId = requestAnimationFrame(tick);
+    if (busy || t - last < 150) return;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) return;
+    busy = true; last = t; flip = !flip;
+    try {
+      const side = Math.round(Math.min(vw, vh) * (flip ? 0.55 : 0.9));
+      scanCanvas.width = side; scanCanvas.height = side;
+      ctx.drawImage(v, (vw - side) / 2, (vh - side) / 2, side, side, 0, 0, side, side);
+      const text = await wasmDecode(ctx.getImageData(0, 0, side, side));
+      if (text && stream) onDecoded(text);
+    } catch(e) { /* keep scanning */ }
+    busy = false;
   };
   scanLoopId = requestAnimationFrame(tick);
+}
+/* Still-photo fallback: the phone's own camera app focuses much closer and
+   shoots at full resolution, which is the most reliable way to read a tiny code. */
+async function decodeImageFile(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const c = document.createElement("canvas");
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    const nat = await getNativeDetector();
+    // whole photo first, then a zoomed-in center crop in case the code is small
+    for (const crop of [1, 0.5, 0.3]) {
+      const sw = W * crop, sh = H * crop;
+      const scale = Math.min(1, 2000 / Math.max(sw, sh));
+      c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
+      ctx.drawImage(img, (W - sw) / 2, (H - sh) / 2, sw, sh, 0, 0, c.width, c.height);
+      if (nat) {
+        try { const codes = await nat.detect(c); if (codes && codes.length) return codes[0].rawValue; } catch(e){}
+      }
+      try {
+        await loadWasmDecoder();
+        const text = await wasmDecode(ctx.getImageData(0, 0, c.width, c.height));
+        if (text) return text;
+      } catch(e) { if (!nat) throw e; }
+    }
+    return null;
+  } finally { URL.revokeObjectURL(url); }
 }
 function onDecoded(text) {
   const val = String(text).trim();
@@ -785,6 +831,29 @@ function onDecoded(text) {
 
 /* scan screen buttons */
 $("btnScanBack").onclick = () => { stopCamera(); if (scanMode === "barcode") pending = null; show("scrTag"); };
+/* photo fallback (uses the phone's own camera app, which focuses closer) */
+$("btnPhotoScan").onclick = () => {
+  stopCamera();
+  $("scanStatus").textContent = "Waiting for photo… (tap Back if the camera doesn't return)";
+  $("photoInput").value = "";
+  $("photoInput").click();
+};
+$("photoInput").addEventListener("cancel", () => { if (!stream) startCamera(); });
+$("photoInput").addEventListener("change", async () => {
+  const f = $("photoInput").files && $("photoInput").files[0];
+  if (!f) { startCamera(); return; }
+  const w = $("scanWarn");
+  w.style.display = "none";
+  $("scanStatus").textContent = "Reading photo…";
+  let text = null, failed = false;
+  try { text = await decodeImageFile(f); } catch(e) { failed = true; }
+  if (text) { onDecoded(text); return; }
+  w.textContent = failed
+    ? "The barcode decoder couldn't load (no signal?). Type the code manually, or try again once you have signal."
+    : "Couldn't find a barcode in that photo. Try again with the code filling more of the picture, in good light and in focus — or type it manually.";
+  w.style.display = "block";
+  startCamera();
+});
 $("btnManualBarcode").onclick = () => {
   $("manualBarcode").value = "";
   if (scanMode === "tag") {
