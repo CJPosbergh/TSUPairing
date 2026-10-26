@@ -424,6 +424,7 @@ let stream = null;
 let scanLoopId = null;
 let detector = null;
 let zxingReader = null;
+let scanCanvas = null;     // offscreen canvas for cropped frame grabs (iOS-friendly decode)
 let lastSavedFile = null;  // { filename, blob, kind: "csv"|"xlsx" }
 let backupEnabled = true;
 let backupInterval = 5;
@@ -635,6 +636,7 @@ $("btnScanTag").onclick = () => {
 async function startCamera() {
   const status = $("scanStatus");
   status.textContent = "Starting camera…";
+  detector = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -642,8 +644,11 @@ async function startCamera() {
     });
     const v = $("video");
     v.srcObject = stream;
+    v.setAttribute("playsinline", "");        // iOS: keep inline, don't open fullscreen player
+    v.setAttribute("webkit-playsinline", "");
+    v.muted = true;
     await v.play();
-    // try native BarcodeDetector with data_matrix + qr
+    // Native BarcodeDetector (Android Chrome). iOS Safari has none, so this stays null there.
     if ("BarcodeDetector" in window) {
       try {
         const fmts = await window.BarcodeDetector.getSupportedFormats();
@@ -660,11 +665,12 @@ async function startCamera() {
     } else {
       status.textContent = "Loading decoder…";
       await loadZXing();
+      if (!window.ZXing) { status.textContent = "Decoder failed to load — type it in manually."; return; }
       status.textContent = prompt;
-      zxingLoop();
+      zxingCanvasLoop();
     }
   } catch (err) {
-    status.textContent = "Camera unavailable — use “Type barcode manually”. (" + (err && err.name || "error") + ")";
+    status.textContent = "Camera unavailable — use “Type manually”. (" + (err && err.name || "error") + ")";
   }
 }
 function stopCamera() {
@@ -694,23 +700,71 @@ function loadZXing() {
     s.onload = resolve;
     s.onerror = () => reject(new Error("decoder load failed"));
     document.head.appendChild(s);
-  }).catch(() => { $("scanStatus").textContent = "Decoder failed to load — type the barcode manually."; });
+  }).catch(() => {});
 }
-function zxingLoop() {
-  if (!window.ZXing || !stream) return;
+/*
+ * iOS-friendly decode. ZXing's decodeFromStream is unreliable on Safari (the
+ * continuous callback often never fires, and it decodes the whole low-res
+ * frame). Instead we grab each frame into a canvas cropped to the center
+ * square and upscaled, then decode that one still frame with the low-level
+ * MultiFormatReader + a canvas luminance source — the stable API path. The
+ * tighter, higher-contrast crop is what lets dense Data Matrix codes read on
+ * iPhone. Works on Android's ZXing path too.
+ */
+function zxingCanvasLoop() {
+  const v = $("video");
+  if (!scanCanvas) scanCanvas = document.createElement("canvas");
+  const ctx = scanCanvas.getContext("2d", { willReadFrequently: true });
+  const Z = window.ZXing;
+  let reader;
   try {
     const hints = new Map();
-    hints.set(window.ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-      window.ZXing.BarcodeFormat.DATA_MATRIX, window.ZXing.BarcodeFormat.QR_CODE
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [
+      Z.BarcodeFormat.DATA_MATRIX, Z.BarcodeFormat.QR_CODE
     ]);
-    hints.set(window.ZXing.DecodeHintType.TRY_HARDER, true);
-    zxingReader = new window.ZXing.BrowserMultiFormatReader(hints, 200);
-    zxingReader.decodeFromStream(stream, $("video"), (result) => {
-      if (result) onDecoded(result.getText());
-    });
+    hints.set(Z.DecodeHintType.TRY_HARDER, true);
+    reader = new Z.MultiFormatReader();
+    reader.setHints(hints);
   } catch(e) {
-    $("scanStatus").textContent = "Decoder error — type the barcode manually.";
+    $("scanStatus").textContent = "Decoder error — type it in manually.";
+    return;
   }
+  const OUT = 640; // upscaled square the decoder sees
+  scanCanvas.width = OUT; scanCanvas.height = OUT;
+
+  // Build a grayscale luminance buffer from the canvas and decode it. Using
+  // RGBLuminanceSource with our own gray values avoids relying on any class
+  // whose browser-build export we can't verify.
+  const decodeFrame = () => {
+    const img = ctx.getImageData(0, 0, OUT, OUT);
+    const d = img.data, n = OUT * OUT;
+    const lum = new Uint8ClampedArray(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      // standard luma; r,g,b already de-gamma'd enough for barcode purposes
+      lum[i] = (d[j] * 306 + d[j+1] * 601 + d[j+2] * 117) >> 10;
+    }
+    const src = new Z.RGBLuminanceSource(lum, OUT, OUT);
+    const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(src));
+    return reader.decodeWithState(bmp); // throws NotFoundException when empty
+  };
+
+  const tick = () => {
+    if (!stream) return;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (vw && vh) {
+      const side = Math.min(vw, vh) * 0.7;   // center square crop, matches on-screen reticle
+      const sx = (vw - side) / 2, sy = (vh - side) / 2;
+      try {
+        ctx.drawImage(v, sx, sy, side, side, 0, 0, OUT, OUT);
+        const res = decodeFrame();
+        if (res) { onDecoded(res.getText()); return; }
+      } catch(e) {
+        try { reader.reset(); } catch(_){}  // clear decoder state between empty frames
+      }
+    }
+    scanLoopId = requestAnimationFrame(tick);
+  };
+  scanLoopId = requestAnimationFrame(tick);
 }
 function onDecoded(text) {
   const val = String(text).trim();
@@ -901,4 +955,3 @@ window.addEventListener("pagehide", stopCamera);
 </script>
 </body>
 </html>
-
